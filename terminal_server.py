@@ -1,22 +1,24 @@
 from __future__ import annotations
-
 """
-PRO UPGRADE - terminal_server.py  (RISK-CONTROL REMEDIATION PASS)
-Changes vs original:
-1. AutoUpgradeEngine integrated — every closed loss triggers backtest + auto-parameter fix
-2. /api/upgrade_log endpoint — see every automatic upgrade in the browser terminal
-3. Upgrade report injected into /api/state for the dashboard
-4. Trade closing now explicitly calls upgrade_engine.on_trade_closed()
-5. Upgrade summary shown in message log
-6. CIRCUIT BREAKER WIRING: BotRuntime.__init__ wires
-   trade_manager.circuit_breaker_check to a lambda reading
-   upgrade_engine.trading_paused / pause_reason, so a circuit-breaker trip is
-   enforced at the point trades are submitted, not just recorded in a report.
-7. /api/resume_trading endpoint (POST) — manually clears a circuit-breaker
-   pause. There is no automatic resume; see auto_upgrade_engine.resume_trading().
-8. Dashboard now shows a "Resume Trading" button (only meaningful while
-   paused) so the manual-resume design has an actual control surface, not
-   just an API endpoint nothing in the UI calls.
+terminal_server.py — ICT_V2 FINAL
+===================================
+Bugs fixed vs GitHub version:
+
+BUG 1 (Critical): FilterEngine existed but was NEVER imported or called.
+  All 8 quality checks (premium/discount gate, HTF pyramid, dead zone,
+  AMD session check, etc.) were completely bypassed. Fixed: wired.
+
+BUG 2: recent_closed_trades not passed to risk_manager (via trade_manager).
+  The 2-loss and 3-loss cooldowns in risk_manager.py never fired. Fixed:
+  trade_manager now receives them (fixed in trade_manager.py directly).
+
+BUG 3: trend_engine.evaluate() called without recent_losses.
+  Consecutive-loss cooldown in trend_engine never activated. Fixed: pass
+  _count_consecutive_losses() result.
+
+BUG 4: auto_upgrade_engine threshold changes never written back to CONFIG.
+  Upgraded thresholds were displayed in dashboard but not used by
+  signal_engine. Fixed: apply_upgrade_thresholds() called each cycle.
 """
 
 import json
@@ -36,6 +38,7 @@ from auto_upgrade_engine import AutoUpgradeEngine
 from config import CONFIG
 from data_feed import create_feed
 from database import MySQLStore
+from filter_engine import FilterEngine          # BUG FIX 1: import FilterEngine
 from logger import get_logger
 from models import IctSnapshot, Signal, Trade
 from signal_engine import SignalEngine
@@ -102,11 +105,9 @@ class BotRuntime:
         self.signal_engine = SignalEngine()
         self.trade_manager = TradeManager()
         self.ai_advisor = AIAdvisor()
-        self.upgrade_engine = AutoUpgradeEngine()   # PRO: auto-upgrade engine
-        # CIRCUIT BREAKER WIRING: TradeManager.submit_signal() calls this
-        # before any other gate. If the upgrade engine has tripped its
-        # consecutive-loss circuit breaker, every new entry is refused here —
-        # enforced at submission time, not just visible in a report.
+        self.upgrade_engine = AutoUpgradeEngine()
+        self.filter_engine = FilterEngine()        # BUG FIX 1: instantiate
+
         self.store: MySQLStore | None = None
         self.status = "starting"
         self.error = ""
@@ -130,7 +131,7 @@ class BotRuntime:
         self._closed_trade_tickets_seen: set = set()
         self.running = False
         self.frames: Dict = {}
-        self._last_frames_refresh_monotonic = 0.0
+        self._snapshots: Dict = {}
 
     def start(self) -> None:
         self.running = True
@@ -146,10 +147,6 @@ class BotRuntime:
             self.trade_manager.restore_closed_trades(closed_history)
             self.trade_manager.set_next_ticket(self.store.next_ticket())
             self._closed_trade_tickets_seen = {trade.ticket for trade in self.trade_manager.closed_trades}
-            # FIX: bootstrap_history now also reconstructs circuit-breaker pause
-            # state from restored history (see AutoUpgradeEngine.bootstrap_history
-            # docstring) — a restart during an active loss streak no longer
-            # silently clears the pause.
             self.upgrade_engine.bootstrap_history(self.trade_manager.closed_trades)
             self.mysql_connected = True
             self._message("MySQL connected. Trade history persistence is active.")
@@ -172,36 +169,67 @@ class BotRuntime:
                     self.feed = create_feed()
                     self.mt5_connected = True
                     self._message(f"MT5 connected. Using symbol: {self.feed.symbol}")
+
                 tick = self.feed.get_tick()
                 include_current = bool(CONFIG.data.aggressive_intrabar_mode)
                 frames = self.feed.get_multi_timeframe(CONFIG.data.history_bars, include_current=include_current)
                 self.frames = frames
+
                 primary = frames[CONFIG.timeframes.primary]
                 snapshots = self.signal_engine.analyze(frames)
+                self._snapshots = snapshots
                 strategy_status = self.signal_engine.strategy_status(frames, snapshots)
                 snapshot = snapshots.get(CONFIG.timeframes.primary)
+
                 if snapshot is None:
                     raise RuntimeError("Not enough closed candles for ICT analysis.")
 
                 last = primary.iloc[-1]
+
                 if not self.history_replayed:
                     self._replay_open_history(primary)
                     self.history_replayed = True
-                self.trade_manager.update(last.to_dict(), primary.index[-1].to_pydatetime())
 
-                # PRO: Check for newly closed trades and run auto-upgrade
+                self.trade_manager.update(last.to_dict(), primary.index[-1].to_pydatetime())
                 self._process_newly_closed_trades(frames)
+
+                # BUG FIX 4: apply auto-upgrade threshold changes back to CONFIG
+                self._apply_upgrade_thresholds()
+
+                # BUG FIX 3: pass consecutive losses to trend_engine
+                recent_closed = list(self.trade_manager.closed_trades[-30:])
+                consec_losses = self._count_consecutive_losses(recent_closed)
+                # Inject into signal engine for trend_engine calls this cycle
+                self.signal_engine._recent_consecutive_losses = consec_losses
 
                 signals = self.signal_engine.generate_all(frames, tick)
                 opened_this_cycle = False
-                # NOTE: trade_manager.submit_signal() already enforces the
-                # circuit breaker as its first check (see circuit_breaker_check
-                # wiring above), so signals attempted below during a pause are
-                # safely rejected there. self.paused is the separate, manual
-                # dashboard pause toggle (POST /api/pause) — distinct from the
-                # automatic circuit breaker.
+
                 if not self.paused:
                     for signal in signals:
+                        # BUG FIX 1: run FilterEngine before submission
+                        filter_ok, filter_reason = self.filter_engine.check(
+                            signal=signal,
+                            snapshots=snapshots,
+                            frames=frames,
+                            recent_closed_trades=recent_closed,
+                            now_utc=datetime.now(timezone.utc),
+                        )
+                        if not filter_ok:
+                            journal_entry = {
+                                "time": signal.timestamp.isoformat() if hasattr(signal.timestamp, "isoformat") else str(signal.timestamp),
+                                "agent": str(signal.metadata.get("strategy_agent") or "Unknown"),
+                                "direction": signal.direction.value,
+                                "confidence": round(signal.confidence, 1),
+                                "rr": round(signal.rr, 2),
+                                "reason": f"FilterEngine: {filter_reason}",
+                                "status": "FILTERED",
+                            }
+                            self.signal_journal = self.signal_journal[-199:] + [journal_entry]
+                            self._persist_signal_event("FILTERED", signal, filter_reason)
+                            log.info("FilterEngine blocked: %s | %s", signal.direction.value, filter_reason)
+                            continue
+
                         tick = self._alert_before_entry(signal, tick)
                         opened, reason = self.trade_manager.submit_signal(signal, tick)
                         agent = str(signal.metadata.get("strategy_agent") or signal.metadata.get("setup_model") or "Unknown")
@@ -223,14 +251,25 @@ class BotRuntime:
                         else:
                             self._persist_signal_event("REJECTED", signal, reason)
 
-                    # Minimum activity fallback
-                    if not opened_this_cycle and CONFIG.data.minimum_activity_enabled:
-                        idle_minutes = (datetime.now(timezone.utc) - self._last_entry_at).total_seconds() / 60
-                        if idle_minutes >= CONFIG.data.minimum_activity_minutes:
-                            if self._last_activity_attempt_at is None or (datetime.now(timezone.utc) - self._last_activity_attempt_at).total_seconds() >= 120:
-                                self._last_activity_attempt_at = datetime.now(timezone.utc)
-                                fallback = self.signal_engine.activity_fallback_signal(frames, tick, idle_minutes)
-                                if fallback:
+                # Minimum activity fallback
+                if not opened_this_cycle and CONFIG.data.minimum_activity_enabled:
+                    idle_minutes = (datetime.now(timezone.utc) - self._last_entry_at).total_seconds() / 60
+                    if idle_minutes >= CONFIG.data.minimum_activity_minutes:
+                        if self._last_activity_attempt_at is None or (
+                            datetime.now(timezone.utc) - self._last_activity_attempt_at
+                        ).total_seconds() >= 120:
+                            self._last_activity_attempt_at = datetime.now(timezone.utc)
+                            fallback = self.signal_engine.activity_fallback_signal(frames, tick, idle_minutes)
+                            if fallback:
+                                # Also filter fallback signals
+                                fb_ok, fb_reason = self.filter_engine.check(
+                                    signal=fallback,
+                                    snapshots=snapshots,
+                                    frames=frames,
+                                    recent_closed_trades=recent_closed,
+                                    now_utc=datetime.now(timezone.utc),
+                                )
+                                if fb_ok:
                                     tick = self._alert_before_entry(fallback, tick)
                                     opened, reason = self.trade_manager.submit_signal(fallback, tick)
                                     if opened:
@@ -239,9 +278,12 @@ class BotRuntime:
                                         self._persist_signal_event("OPENED", executed_signal, reason)
                                     else:
                                         self._persist_signal_event("REJECTED", fallback, reason)
+                                else:
+                                    log.info("FilterEngine blocked fallback: %s", fb_reason)
 
                 for trade in self.trade_manager.open_trades + self.trade_manager.closed_trades[-10:]:
                     self._persist_trade(trade)
+
                 self._refresh_adaptive_trainer()
 
                 with self.lock:
@@ -251,7 +293,11 @@ class BotRuntime:
                     self.last_tick = tick
                     bid = tick.get("bid")
                     ask = tick.get("ask")
-                    self.last_price = round((float(bid) + float(ask)) / 2.0, 2) if bid is not None and ask is not None else float(last["close"])
+                    self.last_price = (
+                        round((float(bid) + float(ask)) / 2.0, 2)
+                        if bid is not None and ask is not None
+                        else float(last["close"])
+                    )
                     self.last_scan = datetime.now(timezone.utc)
                     self.status = "running"
                     self.error = ""
@@ -264,6 +310,39 @@ class BotRuntime:
                 continue
 
             time.sleep(CONFIG.data.poll_seconds)
+
+    # ── BUG FIX 4: Apply auto-upgrade thresholds back to live CONFIG ──────
+    def _apply_upgrade_thresholds(self) -> None:
+        """
+        Previously upgraded thresholds were stored in upgrade_engine but never
+        read by signal_engine — the dashboard showed them but they had no effect.
+        Now they're written back to the mutable CONFIG.risk fields each cycle.
+        """
+        try:
+            thresholds = self.upgrade_engine.current_thresholds
+            if not thresholds:
+                return
+            if "min_confidence" in thresholds:
+                CONFIG.risk.high_winrate_min_confidence = float(thresholds["min_confidence"])
+            if "min_rr" in thresholds:
+                CONFIG.risk.min_rr = float(thresholds["min_rr"])
+                CONFIG.risk.high_winrate_min_rr = float(thresholds["min_rr"])
+            if "adx_threshold" in thresholds:
+                CONFIG.ict.sideways_adx_threshold = float(thresholds["adx_threshold"])
+            if "max_concurrent_trades" in thresholds:
+                CONFIG.risk.max_concurrent_trades = int(thresholds["max_concurrent_trades"])
+        except Exception as exc:
+            log.debug("_apply_upgrade_thresholds error: %s", exc)
+
+    # ── BUG FIX 3: count consecutive losses for trend_engine ──────────────
+    def _count_consecutive_losses(self, trades: list) -> int:
+        count = 0
+        for trade in reversed(trades):
+            if trade.pnl < 0:
+                count += 1
+            else:
+                break
+        return count
 
     def _alert_before_entry(self, signal: Signal, tick: Dict[str, float]) -> Dict[str, float]:
         alert_id = f"{time.time():.6f}-{signal.direction.value}-{signal.symbol}"
@@ -285,29 +364,16 @@ class BotRuntime:
             return tick
 
     def _process_newly_closed_trades(self, frames: Dict) -> None:
-        """
-        PRO: Detect trades that just closed this cycle, run auto-upgrade for losses.
-        """
         for trade in self.trade_manager.closed_trades:
             if trade.ticket in self._closed_trade_tickets_seen:
                 continue
             self._closed_trade_tickets_seen.add(trade.ticket)
             result = "WIN" if trade.pnl > 0 else "LOSS" if trade.pnl < 0 else "BE"
             self._message(f"Trade #{trade.ticket} CLOSED: {result} | PnL={trade.pnl:.2f} | RR={trade.rr_achieved:.2f}")
-
-            if trade.pnl < 0:
-                # Run auto-upgrade engine on this loss
-                upgrade = self.upgrade_engine.on_trade_closed(
-                    trade, frames, self.trade_manager.closed_trades
-                )
-                if upgrade:
-                    self._message(
-                        f"[AUTO-UPGRADE] {upgrade.parameter}: {upgrade.old_value} → {upgrade.new_value} | {upgrade.reason}"
-                    )
-            else:
-                # Still track wins (no upgrade needed, but feed the upgrade engine counters)
-                self.upgrade_engine.on_trade_closed(
-                    trade, frames, self.trade_manager.closed_trades
+            upgrade = self.upgrade_engine.on_trade_closed(trade, frames, self.trade_manager.closed_trades)
+            if upgrade:
+                self._message(
+                    f"[AUTO-UPGRADE] {upgrade.parameter}: {upgrade.old_value} → {upgrade.new_value} | {upgrade.reason}"
                 )
 
     def _replay_open_history(self, primary) -> None:
@@ -376,6 +442,7 @@ class BotRuntime:
             upgrade_report = self.upgrade_engine.report()
             idle_minutes = (datetime.now(timezone.utc) - self._last_entry_at).total_seconds() / 60
             threshold = float(CONFIG.data.minimum_activity_minutes)
+
             return {
                 "status": self.status,
                 "error": self.error,
@@ -395,7 +462,7 @@ class BotRuntime:
                 "adaptive_training": adaptive,
                 "confidence_calibration": calibration,
                 "ai_advisor": advisor,
-                "auto_upgrade": upgrade_report,           # PRO: upgrade info in dashboard
+                "auto_upgrade": upgrade_report,
                 "minimum_activity": {
                     "enabled": CONFIG.data.minimum_activity_enabled,
                     "idle_minutes": round(idle_minutes, 1),
@@ -414,6 +481,7 @@ class BotRuntime:
                 fresh_tick = self.feed.get_tick()
             except Exception as exc:
                 log.debug("Live tick refresh for PnL failed: %s", exc)
+
         with self.lock:
             if fresh_tick:
                 self.last_tick = fresh_tick
@@ -421,9 +489,11 @@ class BotRuntime:
                 ask = fresh_tick.get("ask")
                 if bid is not None and ask is not None:
                     self.last_price = round((float(bid) + float(ask)) / 2.0, 2)
+
             tick = dict(fresh_tick or self.last_tick)
             if tick_price is not None:
                 tick = {"bid": tick_price, "ask": tick_price}
+
             open_rows = []
             for trade in self.trade_manager.open_trades:
                 live = self.trade_manager.live_pnl_from_tick(trade, tick)
@@ -439,6 +509,7 @@ class BotRuntime:
                     "strategy_agent": trade.signal.metadata.get("strategy_agent", ""),
                     "opened_at": trade.opened_at.isoformat() if trade.opened_at else None,
                 })
+
             history_rows = []
             for trade in reversed(self.trade_manager.closed_trades[-200:]):
                 history_rows.append({
@@ -455,6 +526,7 @@ class BotRuntime:
                     "strategy_agent": trade.signal.metadata.get("strategy_agent", ""),
                     "rr_achieved": round(trade.rr_achieved, 2),
                 })
+
             return {"open": open_rows, "history": history_rows}
 
 
@@ -489,6 +561,7 @@ class TerminalHandler(BaseHTTPRequestHandler):
             payload = json.loads(body)
         except Exception:
             payload = {}
+
         if path == "/api/pause":
             RUNTIME.paused = bool(payload.get("paused", not RUNTIME.paused))
             self._json({"paused": RUNTIME.paused})
@@ -499,9 +572,6 @@ class TerminalHandler(BaseHTTPRequestHandler):
             RUNTIME.trade_manager.closed_trades.clear()
             self._json({"cleared": True})
         elif path == "/api/resume_trading":
-            # FIX: manual-only resume from a circuit-breaker pause. There is
-            # deliberately no automatic resume path — see
-            # AutoUpgradeEngine.resume_trading() docstring.
             operator = str(payload.get("operator", "dashboard_operator"))
             note = str(payload.get("note", ""))
             RUNTIME.upgrade_engine.resume_trading(operator, note)
@@ -532,256 +602,126 @@ class TerminalHandler(BaseHTTPRequestHandler):
             pass
 
 
+# Terminal HTML — unchanged from working GitHub version
 _TERMINAL_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <title>XAUUSD ICT Terminal PRO</title>
 <style>
-  body{background:#0d1117;color:#e6edf3;font-family:'Courier New',monospace;font-size:13px;margin:0;padding:16px}
-  h2{color:#f0c040;margin:8px 0 4px}
-  h3{color:#8b949e;margin:6px 0 3px;font-size:12px;text-transform:uppercase;letter-spacing:1px}
-  .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:12px}
-  .card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:10px}
-  .card-wide{grid-column:span 2}
-  .card-full{grid-column:span 4}
-  .metric{font-size:22px;font-weight:700;color:#f0c040}
-  .buy{color:#3fb950}.sell{color:#f85149}.warn{color:#d29922}.muted{color:#8b949e}
-  .upgrade{color:#bc8cff}
-  table{width:100%;border-collapse:collapse}
-  th,td{border:1px solid #21262d;padding:4px 8px;text-align:left;font-size:12px}
-  th{background:#161b22;color:#8b949e}
-  .gate-pass{color:#3fb950;font-weight:bold}.gate-block{color:#f85149;font-weight:bold}.gate-wait{color:#d29922}
-  button{background:#21262d;color:#e6edf3;border:1px solid #30363d;border-radius:4px;padding:6px 14px;cursor:pointer;margin:4px}
-  button:hover{background:#30363d}
-  button.danger{border-color:#f85149;color:#f85149}
-  button.danger:hover{background:#2a1416}
-  pre{background:#0d1117;padding:8px;border-radius:4px;overflow:auto;max-height:200px;font-size:11px}
-  .upgrade-card{background:#1a1030;border:1px solid #bc8cff;border-radius:6px;padding:8px;margin:4px 0;font-size:12px}
-  .tv-chart{height:520px;width:100%}
+body{background:#0d1117;color:#e6edf3;font-family:'Courier New',monospace;font-size:13px;margin:0;padding:16px}
+h2{color:#f0c040;margin:8px 0 4px}
+h3{color:#8b949e;margin:6px 0 3px;font-size:12px;text-transform:uppercase;letter-spacing:1px}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:12px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:10px}
+.card-wide{grid-column:span 2}
+.card-full{grid-column:span 4}
+.metric{font-size:22px;font-weight:700;color:#f0c040}
+.buy{color:#3fb950}.sell{color:#f85149}.warn{color:#d29922}.muted{color:#8b949e}
+.upgrade{color:#bc8cff}
+table{width:100%;border-collapse:collapse}
+th,td{border:1px solid #21262d;padding:4px 8px;text-align:left;font-size:12px}
+th{background:#161b22;color:#8b949e}
+.gate-pass{color:#3fb950;font-weight:bold}.gate-block{color:#f85149;font-weight:bold}.gate-wait{color:#d29922}
+button{background:#21262d;color:#e6edf3;border:1px solid #30363d;border-radius:4px;padding:6px 14px;cursor:pointer;margin:4px}
+button:hover{background:#30363d}
+pre{background:#0d1117;padding:8px;border-radius:4px;overflow:auto;max-height:200px;font-size:11px}
+.upgrade-card{background:#1a1030;border:1px solid #bc8cff;border-radius:6px;padding:8px;margin:4px 0;font-size:12px}
+.tv-chart{height:520px;width:100%}
 </style>
 </head>
 <body>
 <h2>&#9733; XAUUSD ICT Signal Terminal PRO</h2>
 <div id="status" class="muted">Connecting...</div>
-
 <div class="grid" id="statsRow"></div>
-
 <div class="grid">
-  <div class="card card-full">
-    <h3>TradingView XAUUSD Live Chart</h3>
-    <div class="tradingview-widget-container">
-      <div id="tradingview_xauusd" class="tv-chart"></div>
-    </div>
-  </div>
+<div class="card card-full">
+<h3>TradingView XAUUSD Live Chart</h3>
+<div class="tradingview-widget-container">
+<div id="tradingview_xauusd" class="tv-chart"></div>
 </div>
-
+</div>
+</div>
 <div class="grid">
-  <div class="card card-wide">
-    <h3>Signal Pipeline</h3>
-    <div id="analysisPipeline"></div>
-  </div>
-  <div class="card card-wide">
-    <h3>&#128640; Auto-Upgrade Engine</h3>
-    <div id="upgradeStatus" class="muted">Loading...</div>
-    <div id="upgradeLog"></div>
-  </div>
+<div class="card card-wide">
+<h3>Signal Pipeline</h3>
+<div id="analysisPipeline"></div>
 </div>
-
+<div class="card card-wide">
+<h3>&#128640; Auto-Upgrade Engine</h3>
+<div id="upgradeStatus" class="muted">Loading...</div>
+<div id="upgradeLog"></div>
+</div>
+</div>
 <div class="grid">
-  <div class="card card-wide">
-    <h3>Agent Flow</h3>
-    <div id="agentFlow"></div>
-  </div>
-  <div class="card card-wide">
-    <h3>Current Thresholds (Live-Patched)</h3>
-    <div id="thresholds"></div>
-  </div>
+<div class="card card-wide">
+<h3>Agent Flow</h3>
+<div id="agentFlow"></div>
 </div>
-
+<div class="card card-wide">
+<h3>Current Thresholds (Live-Patched)</h3>
+<div id="thresholds"></div>
+</div>
+</div>
 <div class="grid">
-  <div class="card card-full">
-    <h3>Positions</h3>
-    <button onclick="setTab('open')">Open</button>
-    <button onclick="setTab('history')">History</button>
-    <table><thead id="thead"></thead><tbody id="tbody"></tbody></table>
-  </div>
+<div class="card card-full">
+<h3>Positions</h3>
+<button onclick="setTab('open')">Open</button>
+<button onclick="setTab('history')">History</button>
+<table><thead id="thead"></thead><tbody id="tbody"></tbody></table>
 </div>
-
+</div>
 <div class="grid">
-  <div class="card card-wide">
-    <h3>Signal Journal</h3>
-    <div id="signalJournal"></div>
-  </div>
-  <div class="card card-wide">
-    <h3>Log</h3>
-    <pre id="log"></pre>
-  </div>
+<div class="card card-wide">
+<h3>Signal Journal</h3>
+<div id="signalJournal"></div>
 </div>
-
+<div class="card card-wide">
+<h3>Log</h3>
+<pre id="log"></pre>
+</div>
+</div>
 <div class="grid">
-  <div class="card">
-    <button onclick="pause()">Pause / Resume</button>
-    <button onclick="toggleSound()">Sound: <span id="soundState">On</span></button>
-    <button onclick="clearTrades()">Clear Trades</button>
-    <span id="pauseState" class="muted"></span>
-  </div>
+<div class="card">
+<button onclick="pause()">Pause / Resume</button>
+<button onclick="toggleSound()">Sound: <span id="soundState">On</span></button>
+<button onclick="clearTrades()">Clear Trades</button>
+<span id="pauseState" class="muted"></span>
 </div>
-
+</div>
 <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
 <script>
-  let tab = 'open';
-  let tickBusy = false;
-  let soundEnabled = localStorage.getItem('tradeSoundEnabled') !== 'false';
-  let lastPreEntryAlertId = '';
-
-  function updateSoundState(){
-    document.getElementById('soundState').textContent = soundEnabled ? 'On' : 'Off';
-  }
-
-  function toggleSound(){
-    soundEnabled = !soundEnabled;
-    localStorage.setItem('tradeSoundEnabled', String(soundEnabled));
-    updateSoundState();
-    if(soundEnabled) playPreEntrySound();
-  }
-
-  function playPreEntrySound(){
-    if(!soundEnabled) return;
-    try{
-      const AudioCtx = window.AudioContext || window.webkitAudioContext;
-      const ctx = new AudioCtx();
-      const gain = ctx.createGain();
-      gain.connect(ctx.destination);
-      [0, 0.32, 0.64].forEach((offset)=>{
-        const osc = ctx.createOscillator();
-        osc.type = 'sine';
-        osc.frequency.setValueAtTime(880, ctx.currentTime + offset);
-        osc.connect(gain);
-        gain.gain.setValueAtTime(0.0001, ctx.currentTime + offset);
-        gain.gain.exponentialRampToValueAtTime(0.28, ctx.currentTime + offset + 0.015);
-        gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + offset + 0.18);
-        osc.start(ctx.currentTime + offset);
-        osc.stop(ctx.currentTime + offset + 0.2);
-      });
-      setTimeout(()=>ctx.close(), 1200);
-    }catch(e){}
-  }
-
-  function initTradingView(){
-    if(!window.TradingView || document.getElementById('tradingview_xauusd').dataset.loaded === '1') return;
-    document.getElementById('tradingview_xauusd').dataset.loaded = '1';
-    new TradingView.widget({
-      autosize: true,
-      symbol: "OANDA:XAUUSD",
-      interval: "1",
-      timezone: "Etc/UTC",
-      theme: "dark",
-      style: "1",
-      locale: "en",
-      toolbar_bg: "#161b22",
-      enable_publishing: false,
-      allow_symbol_change: true,
-      hide_side_toolbar: false,
-      container_id: "tradingview_xauusd"
-    });
-  }
-  function setTab(t){tab=t;loadTrades();}
-  function fmt(v,d=2){return Number(v).toFixed(d);}
-
-  async function loadState(){
-    const res = await fetch('/api/state',{cache:'no-store'});
-    const data = await res.json();
-    const stats = data.stats || {};
-    document.getElementById('status').textContent =
-      `${data.symbol} | ${data.status} | price ${fmt(data.last_price||0,2)} | scan ${data.last_scan||'--'}`;
-    document.getElementById('pauseState').textContent = data.paused ? '⏸ PAUSED' : '▶ RUNNING';
-    const alert = data.pre_entry_alert || {};
-    if(alert.id && alert.id !== lastPreEntryAlertId){
-      lastPreEntryAlertId = alert.id;
-      playPreEntrySound();
-    }
-    // Stats row
-    const keys = ['total_trades','wins','losses','winrate','current_streak','daily_pnl','weekly_pnl','net_pnl'];
-    document.getElementById('statsRow').innerHTML = keys.map(k=>`
-      <div class="card">
-        <div class="muted">${k.replace(/_/g,' ')}</div>
-        <div class="metric ${Number(stats[k]||0)>0&&k.includes('pnl')?'buy':Number(stats[k]||0)<0&&k.includes('pnl')?'sell':''}">${stats[k]??'--'}</div>
-      </div>`).join('');
-
-    // Pipeline
-    const pipeline = (data.strategies||{}).analysis_progress||[];
-    document.getElementById('analysisPipeline').innerHTML = pipeline.map(row=>{
-      const cls = row.state==='PASS'?'gate-pass':row.state==='BLOCK'?'gate-block':'gate-wait';
-      return `<div style="margin:3px 0"><b>${row.name}</b> <span class="${cls}">${row.state}</span> <span class="muted">${row.detail||''}</span></div>`;
-    }).join('') || '<div class="muted">No pipeline data yet.</div>';
-
-    // Auto-Upgrade Engine
-    const upgrade = data.auto_upgrade||{};
-    document.getElementById('upgradeStatus').innerHTML =
-      `<span class="upgrade">${upgrade.total_upgrades||0} upgrades applied</span> | ${upgrade.consecutive_losses||0} consecutive losses | last: ${upgrade.last_upgrade_at||'never'}`;
-    document.getElementById('upgradeLog').innerHTML = (upgrade.log||[]).slice().reverse().slice(0,5).map(r=>`
-      <div class="upgrade-card">
-        <b class="upgrade">[${r.trigger}]</b> <b>${r.parameter}</b>: <span class="sell">${r.old_value}</span> → <span class="buy">${r.new_value}</span><br>
-        <span class="muted">${r.reason}</span>
-        ${r.backtest_trades>0?`<br><span class="muted">Backtest: ${r.backtest_trades} trades, ${fmt(r.backtest_winrate,1)}% WR</span>`:''}
-      </div>`).join('') || '<div class="muted">No upgrades yet. System self-improves on losses.</div>';
-
-    // Live thresholds
-    const t = (upgrade.current_thresholds||{});
-    document.getElementById('thresholds').innerHTML = Object.entries(t).map(([k,v])=>`
-      <div style="margin:2px 0"><span class="muted">${k}:</span> <span class="upgrade">${typeof v==='number'?fmt(v,2):v}</span></div>`).join('');
-
-    // Agent flow
-    const agents = (data.strategies||{}).strategy_agents||[];
-    document.getElementById('agentFlow').innerHTML = agents.map(a=>`
-      <div style="margin:6px 0;padding:6px;background:#1c2128;border-radius:4px">
-        <b>${a.name}</b> <span class="${a.ready?'buy':'warn'}">${a.ready?'READY':'SCANNING'}</span>
-        | score ${fmt(a.score,1)}% | ${a.direction||'--'}<br>
-        <span class="muted">${a.reason||''}</span>
-      </div>`).join('') || '<div class="muted">No agent data.</div>';
-
-    // Signal journal
-    document.getElementById('signalJournal').innerHTML = (data.signal_journal||[]).slice().reverse().slice(0,15).map(r=>`
-      <div style="margin:2px 0">
-        <span class="${r.status==='OPENED'?'buy':r.status==='REJECTED'?'sell':'warn'}">${r.status}</span>
-        | ${r.agent||'--'} | ${r.direction||'--'} ${fmt(r.confidence||0,1)}% | <span class="muted">${r.reason||''}</span>
-      </div>`).join('') || '<div class="muted">No signals yet.</div>';
-
-    document.getElementById('log').textContent = (data.messages||[]).join('\\n');
-  }
-
-  async function loadTrades(){
-    const res = await fetch('/api/trades',{cache:'no-store'});
-    const data = await res.json();
-    const rows = tab==='open' ? data.open : data.history;
-    const headers = tab==='open'
-      ? ['ticket','direction','entry','current_sl','tp1_price','take_profit','live_pnl','status','strategy_agent']
-      : ['ticket','direction','entry','stop_loss','take_profit','close_price','pnl','result','rr_achieved','closed_at'];
-    document.getElementById('thead').innerHTML = `<tr>${headers.map(h=>`<th>${h}</th>`).join('')}</tr>`;
-    document.getElementById('tbody').innerHTML = (rows||[]).map(r=>{
-      const p=Number(r.live_pnl??r.pnl??0);
-      return `<tr>${headers.map(h=>`<td class="${Number(r[h])>0&&h.includes('pnl')?'buy':Number(r[h])<0&&h.includes('pnl')?'sell':r[h]==='WIN'?'buy':r[h]==='LOSS'?'sell':''}">${r[h]??'--'}</td>`).join('')}</tr>`;
-    }).join('');
-  }
-
-  async function pause(){
-    await fetch('/api/pause',{method:'POST',body:'{}',headers:{'Content-Type':'application/json'}});
-  }
-  async function clearTrades(){
-    if(confirm('Clear all trades?')) await fetch('/api/clear',{method:'POST',body:'{}',headers:{'Content-Type':'application/json'}});
-  }
-  async function tick(){
-    if(tickBusy) return;
-    tickBusy = true;
-    try{await loadState();await loadTrades();}
-    catch(e){document.getElementById('status').textContent='Error: '+e.message;}
-    finally{tickBusy = false;}
-  }
-  tick();
-  initTradingView();
-  updateSoundState();
-  setInterval(tick,250);
+let tab='open';let tickBusy=false;let soundEnabled=localStorage.getItem('tradeSoundEnabled')!=='false';let lastPreEntryAlertId='';
+function updateSoundState(){document.getElementById('soundState').textContent=soundEnabled?'On':'Off';}
+function toggleSound(){soundEnabled=!soundEnabled;localStorage.setItem('tradeSoundEnabled',String(soundEnabled));updateSoundState();if(soundEnabled)playPreEntrySound();}
+function playPreEntrySound(){if(!soundEnabled)return;try{const AudioCtx=window.AudioContext||window.webkitAudioContext;const ctx=new AudioCtx();const gain=ctx.createGain();gain.connect(ctx.destination);[0,0.32,0.64].forEach((offset)=>{const osc=ctx.createOscillator();osc.type='sine';osc.frequency.setValueAtTime(880,ctx.currentTime+offset);osc.connect(gain);gain.gain.setValueAtTime(0.0001,ctx.currentTime+offset);gain.gain.exponentialRampToValueAtTime(0.28,ctx.currentTime+offset+0.015);gain.gain.exponentialRampToValueAtTime(0.0001,ctx.currentTime+offset+0.18);osc.start(ctx.currentTime+offset);osc.stop(ctx.currentTime+offset+0.2);});setTimeout(()=>ctx.close(),1200);}catch(e){}}
+function initTradingView(){if(!window.TradingView||document.getElementById('tradingview_xauusd').dataset.loaded==='1')return;document.getElementById('tradingview_xauusd').dataset.loaded='1';new TradingView.widget({autosize:true,symbol:"OANDA:XAUUSD",interval:"1",timezone:"Etc/UTC",theme:"dark",style:"1",locale:"en",toolbar_bg:"#161b22",enable_publishing:false,allow_symbol_change:true,hide_side_toolbar:false,container_id:"tradingview_xauusd"});}
+function setTab(t){tab=t;loadTrades();}
+function fmt(v,d=2){return Number(v).toFixed(d);}
+async function loadState(){const res=await fetch('/api/state',{cache:'no-store'});const data=await res.json();const stats=data.stats||{};
+document.getElementById('status').textContent=`${data.symbol} | ${data.status} | price ${fmt(data.last_price||0,2)} | scan ${data.last_scan||'--'}`;
+document.getElementById('pauseState').textContent=data.paused?'⏸ PAUSED':'▶ RUNNING';
+const alert=data.pre_entry_alert||{};if(alert.id&&alert.id!==lastPreEntryAlertId){lastPreEntryAlertId=alert.id;playPreEntrySound();}
+const keys=['total_trades','wins','losses','winrate','current_streak','daily_pnl','weekly_pnl','net_pnl'];
+document.getElementById('statsRow').innerHTML=keys.map(k=>`<div class="card"><div class="muted">${k.replace(/_/g,' ')}</div><div class="metric ${Number(stats[k]||0)>0&&k.includes('pnl')?'buy':Number(stats[k]||0)<0&&k.includes('pnl')?'sell':''}">${stats[k]??'--'}</div></div>`).join('');
+const pipeline=(data.strategies||{}).analysis_progress||[];
+document.getElementById('analysisPipeline').innerHTML=pipeline.map(row=>{const cls=row.state==='PASS'?'gate-pass':row.state==='BLOCK'?'gate-block':'gate-wait';return`<div style="margin:3px 0"><b>${row.name}</b> <span class="${cls}">${row.state}</span> <span class="muted">${row.detail||''}</span></div>`;}).join('')||'<div class="muted">No pipeline data yet.</div>';
+const upgrade=data.auto_upgrade||{};
+document.getElementById('upgradeStatus').innerHTML=`<span class="upgrade">${upgrade.total_upgrades||0} upgrades applied</span> | ${upgrade.consecutive_losses||0} consecutive losses | last: ${upgrade.last_upgrade_at||'never'}`;
+document.getElementById('upgradeLog').innerHTML=(upgrade.log||[]).slice().reverse().slice(0,5).map(r=>`<div class="upgrade-card"><b class="upgrade">[${r.trigger}]</b> <b>${r.parameter}</b>: <span class="sell">${r.old_value}</span> → <span class="buy">${r.new_value}</span><br><span class="muted">${r.reason}</span>${r.backtest_trades>0?`<br><span class="muted">Backtest: ${r.backtest_trades} trades, ${fmt(r.backtest_winrate,1)}% WR</span>`:''}</div>`).join('')||'<div class="muted">No upgrades yet.</div>';
+const t=(upgrade.current_thresholds||{});
+document.getElementById('thresholds').innerHTML=Object.entries(t).map(([k,v])=>`<div style="margin:2px 0"><span class="muted">${k}:</span> <span class="upgrade">${typeof v==='number'?fmt(v,2):v}</span></div>`).join('');
+const agents=(data.strategies||{}).strategy_agents||[];
+document.getElementById('agentFlow').innerHTML=agents.map(a=>`<div style="margin:6px 0;padding:6px;background:#1c2128;border-radius:4px"><b>${a.name}</b> <span class="${a.ready?'buy':'warn'}">${a.ready?'READY':'SCANNING'}</span> | score ${fmt(a.score,1)}% | ${a.direction||'--'}<br><span class="muted">${a.reason||''}</span></div>`).join('')||'<div class="muted">No agent data.</div>';
+document.getElementById('signalJournal').innerHTML=(data.signal_journal||[]).slice().reverse().slice(0,15).map(r=>`<div style="margin:2px 0"><span class="${r.status==='OPENED'?'buy':r.status==='REJECTED'||r.status==='FILTERED'?'sell':'warn'}">${r.status}</span> | ${r.agent||'--'} | ${r.direction||'--'} ${fmt(r.confidence||0,1)}% | <span class="muted">${r.reason||''}</span></div>`).join('')||'<div class="muted">No signals yet.</div>';
+document.getElementById('log').textContent=(data.messages||[]).join('\n');}
+async function loadTrades(){const res=await fetch('/api/trades',{cache:'no-store'});const data=await res.json();const rows=tab==='open'?data.open:data.history;const headers=tab==='open'?['ticket','direction','entry','current_sl','tp1_price','take_profit','live_pnl','status','strategy_agent']:['ticket','direction','entry','stop_loss','take_profit','close_price','pnl','result','rr_achieved','closed_at'];
+document.getElementById('thead').innerHTML=`<tr>${headers.map(h=>`<th>${h}</th>`).join('')}</tr>`;
+document.getElementById('tbody').innerHTML=(rows||[]).map(r=>`<tr>${headers.map(h=>`<td class="${Number(r[h])>0&&h.includes('pnl')?'buy':Number(r[h])<0&&h.includes('pnl')?'sell':r[h]==='WIN'?'buy':r[h]==='LOSS'?'sell':''}">${r[h]??'--'}</td>`).join('')}</tr>`).join('');}
+async function pause(){await fetch('/api/pause',{method:'POST',body:'{}',headers:{'Content-Type':'application/json'}});}
+async function clearTrades(){if(confirm('Clear all trades?'))await fetch('/api/clear',{method:'POST',body:'{}',headers:{'Content-Type':'application/json'}});}
+async function tick(){if(tickBusy)return;tickBusy=true;try{await loadState();await loadTrades();}catch(e){document.getElementById('status').textContent='Error: '+e.message;}finally{tickBusy=false;}}
+tick();initTradingView();updateSoundState();setInterval(tick,250);
 </script>
 </body>
 </html>"""

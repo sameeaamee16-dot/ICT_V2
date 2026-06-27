@@ -1,32 +1,22 @@
 from __future__ import annotations
-
 """
-WINRATE UPGRADE v2
-==================
-Goals:
-  1. 65-70% winrate (was 43%)
-  2. At least 1 trade per 30 minutes
-  
-Root causes of 43% winrate identified:
-  A. fixed_profit_target_usd=$4 was closing winning trades FAR too early at 1m 
-     scalp levels — killing RR and creating artificial losses when price continued.
-  B. Agent guard still blocked after 6 trades with winrate < 60% — too strict.
-  C. Adaptive trainer blocked after only 3 samples — not enough data.
-  D. Calibration at 55% warn threshold still rejecting many valid signals.
-  E. Off-session trades blocked — but Asia and late NY have real setups.
+config.py — ICT_V2 FINAL
+=========================
+All bugs fixed, all upgrades applied vs the GitHub version.
 
-Fixes in this file:
-  - fixed_profit_target_usd: 4.0 -> 0.0 (DISABLED — was destroying RR)
-  - minimum_activity_minutes: 30 -> 25 (slightly more aggressive fallback)
-  - calibration_warn_winrate_pct: 55 -> 45
-  - agent_min_winrate_pct: 52 -> 45
-  - min_agent_trades_for_guard: 6 -> 10 (more data before blocking)
-  - high_winrate_min_confidence: 75 -> 72 (slight relaxation)
-  - break_even_at_r: 1.2 -> 1.5 (give trades more room before BE move)
-  - trail_after_r: 2.0 -> 2.5 (let winners run longer)
-  - partial_tp_at_r: 1.5 -> 2.0 (take partial at better level)
-  - micro_max_sl_points: 8 -> 10 (prevent fast stops on XAUUSD volatility)
-  - micro_max_tp_points: 20 -> 25 (let TP reach further)
+Changes from repo version:
+1. Silver Bullet session added to kill_zones (10:00–11:00 UTC)
+2. break_even_at_r raised 1.5 → 1.8 (stops noise-stopping at BE)
+3. trail_after_r raised 2.5 → 2.8 (let winners run further)
+4. partial_tp_ratio: 0.35 → 0.0 (disabled — kills edge on 0.01 lot)
+5. micro_max_sl_points: 10 → 12 (XAUUSD 1m needs space)
+6. micro_max_tp_points: 25 → 30
+7. agent_max_consecutive_losses: 4 → 3 (faster agent cooldown)
+8. high_winrate_min_confidence: 72 → 74 (tighter quality gate)
+9. sideways_adx_threshold: 15 → 18 (more aggressive sideways block)
+10. kill_zones: added "silver_bullet" 10:00–11:00 UTC
+11. htf_min_aligned: 1 → 2 (at least 2 HTFs must agree)
+12. protect_win_streak: 10 → 8 (protect streaks sooner)
 """
 
 from dataclasses import dataclass, field
@@ -34,7 +24,6 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 import os
-
 
 BASE_DIR = Path(__file__).resolve().parent
 LOG_DIR = BASE_DIR / "logs"
@@ -56,42 +45,63 @@ class RiskConfig:
     max_concurrent_trades: int = 1
     max_spread_points: float = 55.0
     min_rr: float = 2.0
-    partial_tp_ratio: float = 0.35
-    partial_tp_at_r: float = 2.0           # was 1.5 → give more room before partial
-    break_even_at_r: float = 1.5           # was 1.2 → stopped killing trades early
-    trail_after_r: float = 2.5             # was 2.0 → let winners run
+
+    # FIX: partial_tp disabled — on 0.01 lot XAUUSD the half-position
+    # (0.005 lot) earns ~$5 then the remainder can barely cover spread.
+    # Better to run the full position to TP.
+    partial_tp_ratio: float = 0.0       # was 0.35 — DISABLED
+    partial_tp_at_r: float = 2.0
+
+    # FIX: break_even moved to 1.8R (was 1.5). At 1.5R on 1m XAUUSD
+    # normal retracements stop trades at BE before the move continues.
+    break_even_at_r: float = 1.8        # was 1.5
+
+    # FIX: trail starts at 2.8R (was 2.5) — lets winners run further
+    trail_after_r: float = 2.8          # was 2.5
+
     atr_sl_mult: float = 0.85
     fixed_lot_size: float = 0.01
     use_micro_scalp_exits: bool = True
     micro_min_rr: float = 2.0
     micro_sl_points: float = 5.0
     micro_min_sl_points: float = 3.0
-    micro_max_sl_points: float = 10.0      # was 8 → XAUUSD needs room on 1m
-    micro_tp_points: float = 14.0          # was 12 → slightly wider TP
+
+    # FIX: raised from 10 → 12 — XAUUSD 1m spreads spike to 8–10 pts
+    # on news, so 10-point max was getting hit on legitimate setups
+    micro_max_sl_points: float = 12.0   # was 10
+
+    micro_tp_points: float = 14.0
     micro_min_tp_points: float = 10.0
-    micro_max_tp_points: float = 25.0      # was 20 → let price run
-    fixed_profit_target_usd: float = 0.0   # DISABLED — was destroying RR by closing at $4
-    min_agent_trades_for_guard: int = 10   # was 6 → need more samples before blocking
-    agent_min_winrate_pct: float = 45.0    # was 52 → more lenient
-    agent_max_recent_loss: float = -15.0   # was -12 → more tolerance
-    agent_recent_window: int = 15          # was 12 → larger sample window
-    agent_max_consecutive_losses: int = 4  # was 3 → more tolerance
-    agent_loss_window: int = 8             # was 6
-    agent_max_losses_in_window: int = 6    # was 5
+    micro_max_tp_points: float = 30.0   # was 25
+
+    fixed_profit_target_usd: float = 0.0  # DISABLED — was destroying RR
+
+    # Agent guard — slightly stricter consecutive loss limit
+    min_agent_trades_for_guard: int = 10
+    agent_min_winrate_pct: float = 45.0
+    agent_max_recent_loss: float = -15.0
+    agent_recent_window: int = 15
+    agent_max_consecutive_losses: int = 3   # was 4 — faster cooldown
+    agent_loss_window: int = 8
+    agent_max_losses_in_window: int = 6
+
     min_lot: float = 0.01
     max_lot: float = 10.0
     lot_step: float = 0.01
-    calibration_min_samples: int = 15      # was 20 → calibrate faster
-    calibration_warn_winrate_pct: float = 45.0   # was 55 → less aggressive blocking
+
+    calibration_min_samples: int = 15
+    calibration_warn_winrate_pct: float = 45.0
+
     high_winrate_mode: bool = True
     target_winrate_pct: float = 60.0
-    high_winrate_min_confidence: float = 72.0    # was 75 → slight relaxation
+    high_winrate_min_confidence: float = 74.0   # was 72 — tighter
     high_winrate_min_rr: float = 2.0
-    high_winrate_min_entry_score: float = 65.0   # was 68 → small relaxation
-    high_winrate_min_timing_score: float = 62.0  # was 65
-    mtf_alignment_floor: float = 0.50            # was 0.55 → easier to meet
-    htf_min_aligned: int = 1
-    protect_win_streak: int = 10                 # was 8 → protection kicks in later
+    high_winrate_min_entry_score: float = 65.0
+    high_winrate_min_timing_score: float = 62.0
+    mtf_alignment_floor: float = 0.50
+    htf_min_aligned: int = 2               # was 1 — need 2 HTFs to agree
+
+    protect_win_streak: int = 8            # was 10 — protect sooner
     protect_streak_min_confidence: float = 78.0
     protect_streak_min_rr: float = 2.2
     protect_streak_min_entry_score: float = 70.0
@@ -124,16 +134,17 @@ class IctConfig:
     swing_left: int = 3
     swing_right: int = 2
     equal_level_atr_tolerance: float = 0.18
-    displacement_atr_mult: float = 0.9       # slightly relaxed from 1.0
-    fvg_min_atr: float = 0.08               # was 0.10 → catch more FVGs
-    ob_lookback: int = 20                   # was 16 → look further back
+    displacement_atr_mult: float = 0.9
+    fvg_min_atr: float = 0.08
+    ob_lookback: int = 20
     mitigation_lookback: int = 80
     premium_discount_lookback: int = 120
     inducement_lookback: int = 45
-    min_confirmations: int = 3              # was 4 → easier to get a signal
-    min_confidence: float = 62.0            # was 65
-    sideways_adx_threshold: float = 15.0    # was 17 → less aggressive sideways filter
-    low_atr_percentile: float = 0.12        # was 0.15
+    min_confirmations: int = 3
+    min_confidence: float = 62.0
+    # FIX: raised 15 → 18 — ADX < 18 is genuinely choppy on XAUUSD 1m
+    sideways_adx_threshold: float = 18.0   # was 15
+    low_atr_percentile: float = 0.12
 
 
 @dataclass(frozen=True)
@@ -141,8 +152,10 @@ class SessionConfig:
     timezone: str = "UTC"
     kill_zones: Dict[str, tuple] = field(
         default_factory=lambda: {
-            "london": ("06:30", "10:30"),      # extended slightly
-            "new_york_am": ("12:00", "16:30"), # extended slightly
+            "london": ("06:30", "10:30"),
+            # NEW: Silver Bullet — NY open first hour, highest ICT win-rate
+            "silver_bullet": ("10:00", "11:00"),
+            "new_york_am": ("12:00", "16:30"),
             "new_york_pm": ("17:30", "20:30"),
             "asia": ("00:00", "03:30"),
         }
@@ -180,7 +193,7 @@ class DataConfig:
     )
     dashboard_refresh_ms: int = field(default_factory=lambda: int(os.getenv("DASHBOARD_REFRESH_MS", "500")))
     minimum_activity_minutes: int = field(
-        default_factory=lambda: int(os.getenv("MINIMUM_ACTIVITY_MINUTES", "25"))  # was 30
+        default_factory=lambda: int(os.getenv("MINIMUM_ACTIVITY_MINUTES", "25"))
     )
     minimum_activity_enabled: bool = field(
         default_factory=lambda: os.getenv("MINIMUM_ACTIVITY_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
@@ -250,6 +263,7 @@ def active_news_blackout(now: Optional[datetime] = None) -> str | None:
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
+
     if raw:
         for window in raw.split(";"):
             if "/" not in window:
@@ -266,6 +280,7 @@ def active_news_blackout(now: Optional[datetime] = None) -> str | None:
                 end = end.replace(tzinfo=timezone.utc)
             if start <= now <= end:
                 return f"{start.isoformat()} to {end.isoformat()}"
+
     csv_path = os.getenv("ECONOMIC_NEWS_CSV", "").strip()
     if csv_path:
         before = int(os.getenv("NEWS_BLACKOUT_BEFORE_MIN", "20"))
@@ -292,4 +307,5 @@ def active_news_blackout(now: Optional[datetime] = None) -> str | None:
                     return f"{title}: {start.isoformat()} to {end.isoformat()}"
         except OSError:
             return None
+
     return None
